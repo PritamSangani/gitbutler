@@ -6,8 +6,12 @@ use lazy_static::lazy_static;
 
 use super::{errors::VerifyError, VirtualBranchesHandle};
 use crate::{
-    git::{self},
-    project_repository::{self, LogUntil},
+    git,
+    project_repository::{
+        self,
+        conflicts::{self, is_conflicting},
+        LogUntil,
+    },
     virtual_branches::branch::BranchCreateRequest,
 };
 
@@ -48,21 +52,29 @@ pub fn get_workspace_head(
         .collect::<Vec<_>>();
 
     let target_commit = repo.find_commit(target.sha)?;
-    let target_tree = target_commit.tree()?;
     let mut workspace_tree = target_commit.tree()?;
 
-    // Merge applied branches into one `workspace_tree`.
-    for branch in &applied_virtual_branches {
-        let branch_head = repo.find_commit(branch.head)?;
-        let branch_tree = branch_head.tree()?;
+    if is_conflicting::<String>(project_repository, None)? {
+        let extra_merge_parent =
+            conflicts::merge_parent(project_repository)?.ok_or(anyhow!("No merge parent"))?;
+        if applied_virtual_branches.len() != 1 {
+            return Err(anyhow!("Expected single branch during conflict resolution"));
+        }
+        let first_branch = applied_virtual_branches[0];
+        let merge_base = repo.merge_base(first_branch.head, extra_merge_parent)?;
+        workspace_tree = repo.find_commit(merge_base)?.tree()?;
+    } else {
+        for branch in &applied_virtual_branches {
+            let branch_tree = repo.find_commit(branch.head)?.tree()?;
+            let merge_tree = repo.find_commit(target.sha)?.tree()?;
 
-        if let Ok(mut result) = repo.merge_trees(&target_tree, &workspace_tree, &branch_tree) {
-            if !result.has_conflicts() {
-                let final_tree_oid = result.write_tree_to(repo)?;
-                workspace_tree = repo.find_tree(final_tree_oid)?;
-            } else {
-                // TODO: Create error type and provide context.
-                return Err(anyhow!("Unexpected merge conflict"));
+            if let Ok(mut result) = repo.merge_trees(&merge_tree, &workspace_tree, &branch_tree) {
+                if !result.has_conflicts() {
+                    let final_tree_oid = result.write_tree_to(repo)?;
+                    workspace_tree = repo.find_tree(final_tree_oid)?;
+                } else {
+                    return Err(anyhow!("Merge conflict between base and {:?}", branch.name));
+                }
             }
         }
     }
